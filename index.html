@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<script src="https://cdn.jsdelivr.net/npm/eruda"></script>
+		<script>
+			eruda.init();
+		</script>
+		<link rel="icon" href="data:," />
+		<title>4-Corner AR Video Overlay</title>
+		<style>
+			body {
+				margin: 0;
+				font-family: sans-serif;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				background: #121212;
+				color: #fff;
+				padding: 10px;
+			}
+			#status {
+				margin: 10px;
+				font-size: 13px;
+				color: #00ff88;
+				text-align: center;
+			}
+			video {
+				position: fixed;
+				top: 0;
+				left: 0;
+				width: 320px;
+				height: 240px;
+				opacity: 0.001;
+				z-index: -1;
+				pointer-events: none;
+			}
+			canvas {
+				max-width: 100%;
+				height: auto;
+				border-radius: 8px;
+				box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+			}
+			button {
+				padding: 12px 20px;
+				font-size: 15px;
+				font-weight: bold;
+				border: none;
+				border-radius: 6px;
+				background: #0088ff;
+				color: white;
+				cursor: pointer;
+			}
+			button:disabled {
+				background: #555;
+			}
+		</style>
+	</head>
+	<body>
+		<h2>4-Corner AR Video Overlay</h2>
+		<button id="startBtn" disabled>Start Camera & Video</button>
+		<div id="status">Loading libraries...</div>
+
+		<!-- Hidden video elements -->
+		<video
+			id="webcam"
+			autoplay
+			playsinline
+			webkit-playsinline
+			muted
+		></video>
+		<!-- NOT muted: this video has sound. It is started from the Start button tap. -->
+		<video
+			id="overlayVid"
+			src="./demo_w_sound.mp4"
+			preload="auto"
+			playsinline
+			webkit-playsinline
+			loop
+		></video>
+
+		<div>
+			<canvas id="outputCanvas" width="640" height="480"></canvas>
+		</div>
+
+		<!-- CommonJS shim so js-aruco (cv.js / aruco.js) can load in the browser -->
+		<script>
+			var module = { exports: {} };
+			var exports = module.exports;
+			function require(path) {
+				return window.CV || module.exports;
+			}
+		</script>
+		<script src="https://cdn.jsdelivr.net/npm/js-aruco@0.1.0/src/cv.js"></script>
+		<script>
+			window.CV = window.CV || module.exports;
+			module = { exports: {} };
+		</script>
+		<script src="https://cdn.jsdelivr.net/npm/js-aruco@0.1.0/src/aruco.js"></script>
+		<script>
+			window.AR = window.AR || module.exports;
+
+			// IMPORTANT: remove the shim. Otherwise opencv.js (a UMD build) sees a
+			// global `module.exports` and exports itself there instead of window.cv.
+			module = undefined;
+			exports = undefined;
+			require = undefined;
+		</script>
+
+		<!-- Main app (defined BEFORE opencv.js so onOpenCvReady always exists) -->
+		<script>
+			// ==================================================================
+			// CONFIG
+			// ==================================================================
+
+			// ---- Physical layout (any unit, e.g. mm; only the RATIOS matter) ----
+			// Markers must be generated with the ARUCO (original) dictionary:
+			//   0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left
+			// MARKER_SIZE : side of each marker's OUTER BLACK square (not the white margin)
+			// FRAME_W/H   : size of the box that contains all 4 markers, measured
+			//               from the OUTER edges of the markers
+			const MARKER_SIZE = 7;
+			const FRAME_W = 148;
+			const FRAME_H = 210;
+
+			// Where the video goes, same units, origin = top-left of the marker box.
+			// null = the FULL marker box, i.e. the video's corners sit on the
+			// OUTERMOST corner of each marker (the video covers the markers).
+			// Keep its aspect ratio equal to the video's, or the video is stretched.
+			const VIDEO_RECT = null; // e.g. { x: 20, y: 20, w: 108, h: 170 }
+
+			// ---- Detection ----
+			const MIN_CANDIDATE_SIZE = 25; // min contour length (px) for a marker candidate
+			const CAMERA_WIDTH = 1920; // lower to 1280x720 if fps is too low
+			const CAMERA_HEIGHT = 1080;
+			const MIN_MARKERS = 3; // 3+ markers -> full perspective fit
+			const ALLOW_DIAGONAL_PAIR = true; // also render with just 0+2 or 1+3 (affine fit)
+			const OUTLIER_FRACTION = 0.3; // drop a marker whose corners disagree by > 30% of its size
+
+			// ---- Stabilization (One Euro filter on the video's 4 corners) ----
+			const SMOOTH_MIN_CUTOFF = 1.0; // lower = smoother when still (more lag)
+			const SMOOTH_BETA = 0.02; // higher = less lag during fast movement
+			const SMOOTH_D_CUTOFF = 1.0;
+			const HOLD_MS = 300; // keep last position this long if markers are lost
+
+			// ---- Audio ----
+			// true: video (and its sound) plays only while the frame is tracked,
+			//       and pauses shortly after the frame is lost.
+			// false: video/sound keeps playing all the time.
+			const PAUSE_WHEN_LOST = true;
+			const PAUSE_AFTER_MS = 1500;
+			// ==================================================================
+
+			const webcam = document.getElementById("webcam");
+			const overlayVid = document.getElementById("overlayVid");
+			const outputCanvas = document.getElementById("outputCanvas");
+			const ctx = outputCanvas.getContext("2d", {
+				willReadFrequently: true,
+			});
+			const statusDiv = document.getElementById("status");
+			const startBtn = document.getElementById("startBtn");
+
+			const vidCanvas = document.createElement("canvas");
+			const vidCtx = vidCanvas.getContext("2d");
+
+			let cvReady = false;
+			let detector = null;
+			let fps = 0;
+			let lastT = performance.now();
+
+			// ---------------- Layout in "world" coordinates ----------------
+			const S = MARKER_SIZE;
+			const MARKER_ORIGIN = {
+				0: { x: 0, y: 0 },
+				1: { x: FRAME_W - S, y: 0 },
+				2: { x: FRAME_W - S, y: FRAME_H - S },
+				3: { x: 0, y: FRAME_H - S },
+			};
+			// Corners of marker `id` in the same order js-aruco reports them: TL, TR, BR, BL
+			function markerWorldCorners(id) {
+				const o = MARKER_ORIGIN[id];
+				return [
+					[o.x, o.y],
+					[o.x + S, o.y],
+					[o.x + S, o.y + S],
+					[o.x, o.y + S],
+				];
+			}
+			const VR = VIDEO_RECT || { x: 0, y: 0, w: FRAME_W, h: FRAME_H };
+			const VIDEO_WORLD = [
+				[VR.x, VR.y],
+				[VR.x + VR.w, VR.y],
+				[VR.x + VR.w, VR.y + VR.h],
+				[VR.x, VR.y + VR.h],
+			];
+
+			// ---------------- One Euro filter ----------------
+			function alphaFor(cutoff, dt) {
+				const tau = 1 / (2 * Math.PI * cutoff);
+				return 1 / (1 + tau / dt);
+			}
+			class OneEuro {
+				constructor() {
+					this.reset();
+				}
+				reset() {
+					this.t = null;
+					this.prev = 0;
+					this.xf = 0;
+					this.dxf = 0;
+				}
+				filter(v, tSec) {
+					if (this.t === null) {
+						this.t = tSec;
+						this.prev = v;
+						this.xf = v;
+						this.dxf = 0;
+						return v;
+					}
+					const dt = Math.max(1e-3, tSec - this.t);
+					this.t = tSec;
+					const dv = (v - this.prev) / dt;
+					this.prev = v;
+					const aD = alphaFor(SMOOTH_D_CUTOFF, dt);
+					this.dxf = aD * dv + (1 - aD) * this.dxf;
+					const cutoff =
+						SMOOTH_MIN_CUTOFF + SMOOTH_BETA * Math.abs(this.dxf);
+					const a = alphaFor(cutoff, dt);
+					this.xf = a * v + (1 - a) * this.xf;
+					return this.xf;
+				}
+			}
+			const quadFilters = Array.from({ length: 8 }, () => new OneEuro());
+			let quad = null; // smoothed video corners in camera pixels [{x,y} x4]
+			let lastGoodT = 0;
+
+			// ---------------- Fitting helpers ----------------
+			function applyH(h, x, y) {
+				const w = h[6] * x + h[7] * y + h[8];
+				return {
+					x: (h[0] * x + h[1] * y + h[2]) / w,
+					y: (h[3] * x + h[4] * y + h[5]) / w,
+				};
+			}
+
+			function markerSidePx(c) {
+				let sum = 0;
+				for (let i = 0; i < 4; i++) {
+					const a = c[i],
+						b = c[(i + 1) % 4];
+					sum += Math.hypot(b.x - a.x, b.y - a.y);
+				}
+				return sum / 4;
+			}
+
+			// Gaussian elimination with partial pivoting; returns null if singular
+			function solveLinear(A, b) {
+				const n = b.length;
+				const M = A.map((row, i) => [...row, b[i]]);
+				for (let c = 0; c < n; c++) {
+					let piv = c;
+					for (let r = c + 1; r < n; r++) {
+						if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+					}
+					if (Math.abs(M[piv][c]) < 1e-9) return null;
+					const tmp = M[c];
+					M[c] = M[piv];
+					M[piv] = tmp;
+					for (let r = c + 1; r < n; r++) {
+						const f = M[r][c] / M[c][c];
+						for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+					}
+				}
+				const x = new Array(n);
+				for (let r = n - 1; r >= 0; r--) {
+					let s = M[r][n];
+					for (let k = r + 1; k < n; k++) s -= M[r][k] * x[k];
+					x[r] = s / M[r][r];
+				}
+				return x;
+			}
+
+			// Full perspective fit (world -> camera) from ALL corners of the given markers
+			function fitHomography(ids, found) {
+				const src = [],
+					dst = [];
+				for (const id of ids) {
+					const wc = markerWorldCorners(id);
+					for (let i = 0; i < 4; i++) {
+						src.push(wc[i][0], wc[i][1]);
+						dst.push(
+							found[id].corners[i].x,
+							found[id].corners[i].y,
+						);
+					}
+				}
+				const n = src.length / 2;
+				const s = cv.matFromArray(n, 1, cv.CV_32FC2, src);
+				const d = cv.matFromArray(n, 1, cv.CV_32FC2, dst);
+				let H = null;
+				try {
+					H = cv.findHomography(s, d, 0, 3);
+					if (!H || H.empty()) return null;
+					return Array.from(H.data64F);
+				} finally {
+					s.delete();
+					d.delete();
+					if (H) H.delete();
+				}
+			}
+
+			// Affine least-squares fit. Used for a diagonal pair of markers: far
+			// more stable than a full perspective fit from just two distant clusters.
+			function fitAffine(ids, found) {
+				const pts = [];
+				for (const id of ids) {
+					const wc = markerWorldCorners(id);
+					for (let i = 0; i < 4; i++) {
+						pts.push({
+							x: wc[i][0],
+							y: wc[i][1],
+							u: found[id].corners[i].x,
+							v: found[id].corners[i].y,
+						});
+					}
+				}
+				const n = pts.length;
+				let mx = 0,
+					my = 0;
+				pts.forEach((p) => {
+					mx += p.x;
+					my += p.y;
+				});
+				mx /= n;
+				my /= n;
+
+				let sxx = 0,
+					sxy = 0,
+					syy = 0;
+				let bux = 0,
+					buy = 0,
+					bu = 0,
+					bvx = 0,
+					bvy = 0,
+					bv = 0;
+				for (const p of pts) {
+					const x = p.x - mx,
+						y = p.y - my;
+					sxx += x * x;
+					sxy += x * y;
+					syy += y * y;
+					bux += x * p.u;
+					buy += y * p.u;
+					bu += p.u;
+					bvx += x * p.v;
+					bvy += y * p.v;
+					bv += p.v;
+				}
+				// x and y are centered, so their sums are 0
+				const M = [
+					[sxx, sxy, 0],
+					[sxy, syy, 0],
+					[0, 0, n],
+				];
+				const pu = solveLinear(M, [bux, buy, bu]);
+				const pv = solveLinear(M, [bvx, bvy, bv]);
+				if (!pu || !pv) return null;
+				return [
+					pu[0],
+					pu[1],
+					pu[2] - pu[0] * mx - pu[1] * my,
+					pv[0],
+					pv[1],
+					pv[2] - pv[0] * mx - pv[1] * my,
+					0,
+					0,
+					1,
+				];
+			}
+
+			// A set of markers is usable if it has 3+, or (optionally) a diagonal pair
+			function isUsableSet(ids) {
+				if (ids.length >= MIN_MARKERS) return true;
+				return (
+					ALLOW_DIAGONAL_PAIR &&
+					ids.length === 2 &&
+					ids[1] - ids[0] === 2
+				);
+			}
+
+			// Fit, and drop markers that disagree with the rest (e.g. misread IDs)
+			function fitWithOutlierRejection(found) {
+				let ids = [0, 1, 2, 3].filter((id) => found[id]);
+				while (isUsableSet(ids)) {
+					const h =
+						ids.length >= 3
+							? fitHomography(ids, found)
+							: fitAffine(ids, found);
+					if (!h) return null;
+
+					let worstId = -1,
+						worst = 0,
+						sideSum = 0;
+					for (const id of ids) {
+						const wc = markerWorldCorners(id);
+						let err = 0;
+						for (let i = 0; i < 4; i++) {
+							const p = applyH(h, wc[i][0], wc[i][1]);
+							err += Math.hypot(
+								p.x - found[id].corners[i].x,
+								p.y - found[id].corners[i].y,
+							);
+						}
+						err /= 4;
+						sideSum += markerSidePx(found[id].corners);
+						if (err > worst) {
+							worst = err;
+							worstId = id;
+						}
+					}
+					const limit = Math.max(
+						2,
+						OUTLIER_FRACTION * (sideSum / ids.length),
+					);
+					if (worst <= limit) {
+						return { h, ids, model: ids.length >= 3 ? "H" : "A" };
+					}
+					ids = ids.filter((id) => id !== worstId);
+				}
+				return null;
+			}
+
+			// Reject twisted/degenerate quads
+			function isValidQuad(p) {
+				let sign = 0;
+				for (let i = 0; i < 4; i++) {
+					const a = p[i],
+						b = p[(i + 1) % 4],
+						c = p[(i + 2) % 4];
+					const cross =
+						(b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+					if (cross === 0) return false;
+					const sgn = cross > 0 ? 1 : -1;
+					if (sign && sgn !== sign) return false;
+					sign = sgn;
+				}
+				return true;
+			}
+
+			// ---------------- Video / audio control ----------------
+			let playRequested = false;
+			function setVideoPlaying(want) {
+				if (want && overlayVid.paused && !playRequested) {
+					playRequested = true;
+					overlayVid
+						.play()
+						.catch((e) => console.warn("Video play failed:", e))
+						.finally(() => {
+							playRequested = false;
+						});
+				} else if (!want && !overlayVid.paused && !playRequested) {
+					overlayVid.pause();
+				}
+			}
+
+			// ---------------- Setup ----------------
+			// Wait until the OpenCV.js WASM runtime is truly initialized.
+			function onOpenCvReady() {
+				const done = () => {
+					cvReady = true;
+					setupDetector();
+				};
+				if (typeof cv.getBuildInformation === "function") {
+					done();
+				} else if (typeof cv.then === "function") {
+					cv.then((m) => {
+						window.cv = m;
+						done();
+					});
+				} else {
+					cv.onRuntimeInitialized = done;
+				}
+			}
+
+			function setupDetector() {
+				if (!(window.AR && window.AR.Detector)) {
+					statusDiv.innerText =
+						"js-aruco failed to load (check console).";
+					return;
+				}
+
+				// Only relax the minimum candidate size; leave the rest of the
+				// original detection pipeline untouched.
+				const origFind = AR.Detector.prototype.findCandidates;
+				AR.Detector.prototype.findCandidates = function (
+					contours,
+					minSize,
+					eps,
+					minLen,
+				) {
+					return origFind.call(
+						this,
+						contours,
+						Math.min(minSize, MIN_CANDIDATE_SIZE),
+						eps,
+						minLen,
+					);
+				};
+
+				detector = new AR.Detector();
+				startBtn.disabled = false;
+				statusDiv.innerText = "Ready. Tap 'Start Camera & Video'.";
+			}
+
+			startBtn.addEventListener("click", async () => {
+				if (!cvReady || !detector) return;
+				startBtn.disabled = true;
+
+				// This tap is the user gesture that unlocks audio playback.
+				overlayVid.muted = false;
+				overlayVid.volume = 1;
+				overlayVid
+					.play()
+					.then(() => {
+						// Started from the tap (unlocks sound). If we only want it
+						// to run while tracked, pause until the frame is found.
+						if (PAUSE_WHEN_LOST) overlayVid.pause();
+					})
+					.catch((e) => {
+						console.warn("Video play failed:", e);
+						statusDiv.innerText =
+							"Video/audio blocked: " + e.message;
+					});
+
+				try {
+					const stream = await navigator.mediaDevices.getUserMedia({
+						video: {
+							facingMode: { ideal: "environment" },
+							width: { ideal: CAMERA_WIDTH },
+							height: { ideal: CAMERA_HEIGHT },
+						},
+						audio: false,
+					});
+
+					webcam.srcObject = stream;
+					await webcam.play();
+
+					outputCanvas.width = webcam.videoWidth || CAMERA_WIDTH;
+					outputCanvas.height = webcam.videoHeight || CAMERA_HEIGHT;
+
+					statusDiv.innerText = "Tracking active.";
+					requestAnimationFrame(processFrame);
+				} catch (err) {
+					statusDiv.innerText = "Camera Error: " + err.message;
+					startBtn.disabled = false;
+				}
+			});
+
+			// ---------------- Main loop ----------------
+			function processFrame() {
+				const now = performance.now();
+				try {
+					if (webcam.readyState >= 2) {
+						ctx.drawImage(
+							webcam,
+							0,
+							0,
+							outputCanvas.width,
+							outputCanvas.height,
+						);
+
+						const imageData = ctx.getImageData(
+							0,
+							0,
+							outputCanvas.width,
+							outputCanvas.height,
+						);
+						const markers = detector.detect(imageData);
+
+						// Faint cyan outlines around raw square candidates
+						if (detector.candidates) {
+							ctx.strokeStyle = "rgba(0, 255, 255, 0.4)";
+							ctx.lineWidth = 1;
+							for (
+								let i = 0;
+								i < detector.candidates.length;
+								i++
+							) {
+								const c = detector.candidates[i];
+								ctx.beginPath();
+								ctx.moveTo(c[0].x, c[0].y);
+								ctx.lineTo(c[1].x, c[1].y);
+								ctx.lineTo(c[2].x, c[2].y);
+								ctx.lineTo(c[3].x, c[3].y);
+								ctx.closePath();
+								ctx.stroke();
+							}
+						}
+
+						const found = {};
+						let sideSum = 0,
+							sideCount = 0;
+
+						// Solid green boxes over fully decoded markers
+						for (let i = 0; i < markers.length; i++) {
+							const m = markers[i];
+							const cx =
+								(m.corners[0].x +
+									m.corners[1].x +
+									m.corners[2].x +
+									m.corners[3].x) /
+								4;
+							const cy =
+								(m.corners[0].y +
+									m.corners[1].y +
+									m.corners[2].y +
+									m.corners[3].y) /
+								4;
+
+							ctx.strokeStyle = "#00ff00";
+							ctx.lineWidth = 3;
+							ctx.beginPath();
+							ctx.moveTo(m.corners[0].x, m.corners[0].y);
+							for (let j = 1; j < 4; j++)
+								ctx.lineTo(m.corners[j].x, m.corners[j].y);
+							ctx.closePath();
+							ctx.stroke();
+
+							ctx.fillStyle = "#ffff00";
+							ctx.font = "bold 20px monospace";
+							ctx.fillText(`ID: ${m.id}`, cx - 20, cy - 10);
+
+							if (m.id >= 0 && m.id <= 3) {
+								found[m.id] = { corners: m.corners };
+								sideSum += markerSidePx(m.corners);
+								sideCount++;
+							}
+						}
+
+						// Place the video from the detected marker corners, then smooth it
+						const fit = fitWithOutlierRejection(found);
+						let used = 0;
+						let model = "-";
+						if (fit) {
+							const proj = VIDEO_WORLD.map((p) =>
+								applyH(fit.h, p[0], p[1]),
+							);
+							if (
+								proj.every(
+									(p) => isFinite(p.x) && isFinite(p.y),
+								) &&
+								isValidQuad(proj)
+							) {
+								const t = now / 1000;
+								quad = proj.map((p, i) => ({
+									x: quadFilters[i * 2].filter(p.x, t),
+									y: quadFilters[i * 2 + 1].filter(p.y, t),
+								}));
+								lastGoodT = now;
+								used = fit.ids.length;
+								model = fit.model;
+							}
+						}
+						if (quad && now - lastGoodT > HOLD_MS) {
+							quad = null;
+							quadFilters.forEach((f) => f.reset());
+						}
+
+						// Audio/video: play while tracked, pause a bit after losing the frame
+						if (PAUSE_WHEN_LOST) {
+							setVideoPlaying(
+								lastGoodT > 0 &&
+									now - lastGoodT < PAUSE_AFTER_MS,
+							);
+						}
+
+						// Diagnostic HUD
+						fps =
+							fps * 0.9 + (1000 / Math.max(1, now - lastT)) * 0.1;
+						lastT = now;
+						const detectedIds =
+							Object.keys(found).sort().join(", ") || "None";
+						const numQuads = detector.candidates
+							? detector.candidates.length
+							: 0;
+						const avgSide = sideCount
+							? (sideSum / sideCount).toFixed(0)
+							: "-";
+
+						ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+						ctx.fillRect(10, 10, 430, 75);
+						ctx.fillStyle = "#00ff66";
+						ctx.font = "14px monospace";
+						ctx.fillText(
+							`Quads: ${numQuads} | Markers: [${detectedIds}] | ${fps.toFixed(0)} fps`,
+							18,
+							30,
+						);
+						ctx.fillText(
+							`Used: ${used}/4 (${model}) | marker size: ${avgSide}px`,
+							18,
+							50,
+						);
+						ctx.fillText(
+							`Video: paused=${overlayVid.paused} | ready=${overlayVid.readyState} | muted=${overlayVid.muted}`,
+							18,
+							70,
+						);
+
+						if (quad) warpVideo(quad);
+					}
+				} catch (err) {
+					console.error("Frame loop error:", err);
+				}
+
+				requestAnimationFrame(processFrame);
+			}
+
+			function warpVideo(dst) {
+				if (overlayVid.readyState < 2) return;
+
+				vidCanvas.width = overlayVid.videoWidth || 320;
+				vidCanvas.height = overlayVid.videoHeight || 240;
+				vidCtx.drawImage(
+					overlayVid,
+					0,
+					0,
+					vidCanvas.width,
+					vidCanvas.height,
+				);
+
+				let vidMat,
+					bgMat,
+					warpedMat,
+					mask,
+					white,
+					srcCoords,
+					dstCoords,
+					H;
+				try {
+					vidMat = cv.imread(vidCanvas);
+					bgMat = cv.imread(outputCanvas);
+					warpedMat = new cv.Mat();
+					mask = new cv.Mat();
+
+					// Source quad (video corners)
+					srcCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [
+						0,
+						0,
+						vidMat.cols,
+						0,
+						vidMat.cols,
+						vidMat.rows,
+						0,
+						vidMat.rows,
+					]);
+
+					// Destination quad (0=TL, 1=TR, 2=BR, 3=BL)
+					dstCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [
+						dst[0].x,
+						dst[0].y,
+						dst[1].x,
+						dst[1].y,
+						dst[2].x,
+						dst[2].y,
+						dst[3].x,
+						dst[3].y,
+					]);
+
+					H = cv.getPerspectiveTransform(srcCoords, dstCoords);
+					const size = new cv.Size(
+						outputCanvas.width,
+						outputCanvas.height,
+					);
+
+					cv.warpPerspective(vidMat, warpedMat, H, size);
+
+					// Mask = warped solid-white rectangle (so black video pixels stay visible)
+					white = new cv.Mat(
+						vidMat.rows,
+						vidMat.cols,
+						cv.CV_8UC1,
+						new cv.Scalar(255),
+					);
+					cv.warpPerspective(
+						white,
+						mask,
+						H,
+						size,
+						cv.INTER_NEAREST,
+						cv.BORDER_CONSTANT,
+						new cv.Scalar(0),
+					);
+
+					warpedMat.copyTo(bgMat, mask);
+					cv.imshow(outputCanvas, bgMat);
+				} catch (err) {
+					console.error("warpVideo error:", err);
+				} finally {
+					[
+						vidMat,
+						bgMat,
+						warpedMat,
+						mask,
+						white,
+						srcCoords,
+						dstCoords,
+						H,
+					].forEach((m) => {
+						if (m) m.delete();
+					});
+				}
+			}
+		</script>
+
+		<!-- OpenCV.js for perspective warping (loaded last; calls onOpenCvReady) -->
+		<script
+			async
+			src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js"
+			onload="onOpenCvReady()"
+			type="text/javascript"
+		></script>
+	</body>
+</html>
